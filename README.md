@@ -1,0 +1,2 @@
+# MemoRiseApp
+Memorize easily 
