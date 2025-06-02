@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MemoRise - Your Mnemonic Helper</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script type="module">
+        // Firebase App (the core Firebase SDK) is always required and must be listed first
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, addDoc, collection, getDocs, onSnapshot, query, orderBy, serverTimestamp, deleteDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js"; 
+
+        // IMPORTANT: Replace with your actual Firebase config object
+        // Option 1: Directly paste your config here
+        const firebaseConfig = {
+            apiKey: "YOUR_API_KEY", // Replace with your actual Firebase config
+            authDomain: "YOUR_AUTH_DOMAIN",
+            projectId: "YOUR_PROJECT_ID",
+            storageBucket: "YOUR_STORAGE_BUCKET",
+            messagingSenderId: "YOUR_MESSAGING_SENDER_ID",
+            appId: "YOUR_APP_ID"
+        };
+        // Option 2: Or, if you are injecting it globally (e.g., via a script tag before this one)
+        // const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : { /* fallback or error */ };
+
+
+        // Initialize Firebase
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        setLogLevel('debug'); // Use 'debug' for development, 'silent' for production
+
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-memorise-app';
+        let userId = null;
+        let isAuthReady = false;
+        let mnemonicsUnsubscribe = null; // To store the onSnapshot listener
+
+        // DOM Elements
+        const listInput = document.getElementById('listInput');
+        const generateBtn = document.getElementById('generateBtn');
+        const clearInputsBtn = document.getElementById('clearInputsBtn');
+        const mnemonicDisplay = document.getElementById('mnemonicDisplay');
+        const explanationDisplay = document.getElementById('explanationDisplay');
+        const listNameInput = document.getElementById('listNameInput');
+        const saveBtn = document.getElementById('saveBtn');
+        const savedListsContainer = document.getElementById('savedListsContainer');
+        const statusMessage = document.getElementById('statusMessage');
+        const loadingIndicator = document.getElementById('loadingIndicator');
+        const userIdDisplay = document.getElementById('userIdDisplay');
+        const aiModelEndpoint = 'http://127.0.0.1:1234/v1/chat/completions'; // User's local LM Studio endpoint
+
+        // --- Authentication ---
+        onAuthStateChanged(auth, async (user) => {
+            if (user) {
+                console.log("User is signed in:", user.uid);
+                userId = user.uid;
+                userIdDisplay.textContent = `User ID: ${userId}`;
+            } else {
+                console.log("User is not signed in. Attempting anonymous sign-in or custom token.");
+                userIdDisplay.textContent = 'User ID: Authenticating...';
+                try {
+                    if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                        await signInWithCustomToken(auth, __initial_auth_token);
+                        console.log("Signed in with custom token.");
+                        userId = auth.currentUser?.uid;
+                    } else {
+                        await signInAnonymously(auth);
+                        console.log("Signed in anonymously.");
+                        userId = auth.currentUser?.uid;
+                    }
+                    if (userId) userIdDisplay.textContent = `User ID: ${userId}`;
+                } catch (error) {
+                    console.error("Error during sign-in:", error);
+                    userId = `local-anon-${crypto.randomUUID()}`; // Fallback non-Firebase UID
+                    userIdDisplay.textContent = `User ID: ${userId} (Local Fallback - Data not synced to cloud)`;
+                    setStatus(`Error signing in: ${error.message}. Using local non-Firebase UID. Saved data might not persist correctly.`, 'error');
+                }
+            }
+            isAuthReady = true;
+            if (userId && userId.startsWith('local-anon-') === false) { // Only load from Firebase if auth is not local fallback
+                loadSavedLists();
+            } else if (!userId) {
+                 setStatus('Authentication failed. Cannot save or load lists from cloud.', 'error');
+            }
+        });
+
+        function setStatus(message, type = 'info', duration = 5000) {
+            statusMessage.textContent = message;
+            statusMessage.className = 'mt-4 p-3 rounded-md text-sm ';
+            if (type === 'error') {
+                statusMessage.classList.add('bg-red-100', 'text-red-700');
+            } else if (type === 'success') {
+                statusMessage.classList.add('bg-green-100', 'text-green-700');
+            } else { // info
+                statusMessage.classList.add('bg-blue-100', 'text-blue-700');
+            }
+            statusMessage.classList.remove('hidden');
+            if (duration > 0) {
+                setTimeout(() => statusMessage.classList.add('hidden'), duration);
+            }
+        }
+
+        function showLoading(show) {
+            loadingIndicator.classList.toggle('hidden', !show);
+        }
+
+        function clearAllCurrentInputs() {
+            listInput.value = '';
+            mnemonicDisplay.textContent = 'Your generated mnemonic will appear here...';
+            explanationDisplay.textContent = 'Explanation will appear here...';
+            listNameInput.value = '';
+            saveBtn.disabled = true;
+            listNameInput.disabled = true;
+            setStatus('Inputs cleared.', 'info', 3000);
+        }
+
+        clearInputsBtn.addEventListener('click', clearAllCurrentInputs);
+
+        // --- Mnemonic Generation ---
+        generateBtn.addEventListener('click', async () => {
+            const itemsText = listInput.value.trim();
+            if (!itemsText) {
+                setStatus('Please enter a list of items.', 'error');
+                return;
+            }
+
+            const itemsArray = itemsText.split('\n').map(item => item.trim()).filter(item => item);
+            if (itemsArray.length < 2) {
+                setStatus('Please enter at least two items for a mnemonic.', 'error');
+                return;
+            }
+
+            showLoading(true);
+            mnemonicDisplay.textContent = '';
+            explanationDisplay.textContent = '';
+            setStatus('🧠 Generating mnemonic with your local AI model...', 'info', 0); // Keep visible while loading
+
+            const systemPrompt = `You are MemoRise, a friendly and highly creative AI assistant specializing in crafting memorable mnemonic devices. Your goal is to help users remember lists of items easily. Respond ONLY with the mnemonic device and its explanation. Use the following format STRICTLY:
+MNEMONIC_DEVICE_START
+[Your Mnemonic Device Here - Be creative and ensure it relates to all items if possible. Make it catchy!]
+MNEMONIC_DEVICE_END
+EXPLANATION_START
+[Your Explanation Here - Clearly explain how the mnemonic helps remember the list items, highlighting the connection.]
+EXPLANATION_END`;
+            const userPrompt = `Please create a mnemonic device for the following list:\n${itemsArray.join('\n')}`;
+
+            try {
+                const response = await fetch(aiModelEndpoint, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        model: "qwen3-32b", 
+                        messages: [
+                            { role: "system", content: systemPrompt },
+                            { role: "user", content: userPrompt }
+                        ],
+                        temperature: 0.7,
+                        stream: false
+                    }),
+                });
+
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    throw new Error(`AI server error: ${response.status} ${response.statusText}. Details: ${errorText}. Make sure your LM Studio server is running, accessible at ${aiModelEndpoint}, has a model loaded, and CORS is configured correctly if necessary.`);
+                }
+
+                const data = await response.json();
+                
+                let aiResponseContent = "";
+                if (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) {
+                    aiResponseContent = data.choices[0].message.content;
+                } else {
+                    throw new Error("AI response format is unexpected. Full response: " + JSON.stringify(data));
+                }
+
+                const mnemonicMatch = aiResponseContent.match(/MNEMONIC_DEVICE_START\n([\s\S]*?)\nMNEMONIC_DEVICE_END/);
+                const explanationMatch = aiResponseContent.match(/EXPLANATION_START\n([\s\S]*?)\nEXPLANATION_END/);
+
+                if (mnemonicMatch && mnemonicMatch[1] && explanationMatch && explanationMatch[1]) {
+                    mnemonicDisplay.textContent = mnemonicMatch[1].trim();
+                    explanationDisplay.textContent = explanationMatch[1].trim();
+                    setStatus('Mnemonic generated successfully! Ready to save.', 'success');
+                    saveBtn.disabled = false;
+                    listNameInput.disabled = false;
+                    listNameInput.focus(); // Focus on list name input
+                } else {
+                    mnemonicDisplay.textContent = "Could not parse AI response. Raw response part:";
+                    explanationDisplay.textContent = aiResponseContent.substring(0, 500) + (aiResponseContent.length > 500 ? "..." : "");
+                    throw new Error('Could not parse the mnemonic and explanation from AI response. Ensure the AI model is strictly following the specified format in its output. Check the console for the raw AI response.');
+                }
+
+            } catch (error) {
+                console.error('Error generating mnemonic:', error);
+                setStatus(`Error generating mnemonic: ${error.message}`, 'error', 0);
+                mnemonicDisplay.textContent = 'Failed to generate mnemonic.';
+                explanationDisplay.textContent = 'Please check the browser console (F12) for detailed errors and ensure your local AI server is running correctly and accessible. The AI model also needs to follow the output format instructions strictly.';
+            } finally {
+                showLoading(false);
+            }
+        });
+
+        // --- Saving and Loading Lists (Firestore) ---
+        saveBtn.addEventListener('click', async () => {
+            if (!isAuthReady || !userId || userId.startsWith('local-anon-')) {
+                setStatus('Authentication not ready or using local fallback UID. Cannot save to cloud. Please ensure you are properly authenticated with Firebase.', 'error');
+                return;
+            }
+
+            const listName = listNameInput.value.trim();
+            const items = listInput.value.trim();
+            const mnemonic = mnemonicDisplay.textContent.trim();
+            const explanation = explanationDisplay.textContent.trim();
+
+            if (!listName) {
+                setStatus('Please enter a name for your list.', 'error');
+                listNameInput.focus();
+                return;
+            }
+            if (!items || !mnemonic || mnemonic === 'Your generated mnemonic will appear here...' || mnemonic === 'Failed to generate mnemonic.') {
+                setStatus('No valid list or mnemonic to save. Please generate a mnemonic first.', 'error');
+                return;
+            }
+
+            showLoading(true);
+            setStatus('💾 Saving list to your Memory Vault...', 'info', 0);
+
+            try {
+                const userMnemonicsCollection = collection(db, `artifacts/${appId}/users/${userId}/mnemonics`);
+                await addDoc(userMnemonicsCollection, {
+                    name: listName,
+                    items: items,
+                    mnemonic: mnemonic,
+                    explanation: explanation,
+                    createdAt: serverTimestamp()
+                });
+                setStatus('List saved successfully to your Memory Vault!', 'success');
+                clearAllCurrentInputs(); // Clear inputs after successful save
+            } catch (error) {
+                console.error('Error saving list to Firestore:', error);
+                setStatus(`Error saving list: ${error.message}`, 'error', 0);
+            } finally {
+                showLoading(false);
+            }
+        });
+
+        async function loadSavedLists() {
+            if (!isAuthReady || !userId || userId.startsWith('local-anon-')) {
+                console.log("Auth not ready or using local fallback UID for loading lists from cloud.");
+                savedListsContainer.innerHTML = '<p class="text-gray-500">Authenticate with Firebase to see your saved mnemonics.</p>';
+                return;
+            }
+
+            showLoading(true);
+            setStatus('🔄 Loading saved lists from your Memory Vault...', 'info', 0);
+            
+            if (mnemonicsUnsubscribe) {
+                mnemonicsUnsubscribe(); // Unsubscribe from previous listener
+            }
+
+            const userMnemonicsCollection = collection(db, `artifacts/${appId}/users/${userId}/mnemonics`);
+            const q = query(userMnemonicsCollection); // Removed orderBy for simplicity, will sort client-side
+
+            mnemonicsUnsubscribe = onSnapshot(q, (querySnapshot) => {
+                savedListsContainer.innerHTML = ''; 
+                if (querySnapshot.empty) {
+                    savedListsContainer.innerHTML = '<p class="text-gray-500">No saved mnemonics yet in your vault. Create and save one! 🚀</p>';
+                } else {
+                    const lists = [];
+                    querySnapshot.forEach((doc) => {
+                        lists.push({ id: doc.id, ...doc.data() });
+                    });
+
+                    lists.sort((a, b) => {
+                        if (a.createdAt && b.createdAt) {
+                            return b.createdAt.toMillis() - a.createdAt.toMillis(); // Newest first
+                        }
+                        return (a.name || "").localeCompare(b.name || ""); // Fallback to name
+                    });
+
+                    lists.forEach(listData => {
+                        const div = document.createElement('div');
+                        div.className = 'p-4 border border-gray-300 rounded-lg shadow-sm bg-white hover:shadow-lg transition-shadow cursor-pointer transform hover:-translate-y-1';
+                        div.innerHTML = `
+                            <div class="flex justify-between items-start">
+                                <h3 class="text-lg font-semibold text-blue-700 mb-1">${listData.name || 'Untitled List'}</h3>
+                                <button data-id="${listData.id}" class="delete-btn text-xs text-red-500 hover:text-red-700 font-medium">🗑️ Delete</button>
+                            </div>
+                            <p class="text-sm text-gray-700 mt-1"><strong>Mnemonic:</strong> ${listData.mnemonic.substring(0, 70)}${listData.mnemonic.length > 70 ? '...' : ''}</p>
+                            <p class="text-xs text-gray-500 mt-2">Items: ${listData.items.split('\n').length} | Saved: ${listData.createdAt ? new Date(listData.createdAt.toDate()).toLocaleDateString() : 'N/A'}</p>
+                        `;
+                        // Main card click to view
+                        div.addEventListener('click', (e) => {
+                            if (e.target.classList.contains('delete-btn') || e.target.closest('.delete-btn')) return; 
+                            viewSavedList(listData);
+                        });
+                        
+                        // Delete button event listener
+                        const deleteButton = div.querySelector('.delete-btn');
+                        deleteButton.addEventListener('click', async (e) => {
+                            e.stopPropagation(); // Prevent card click when deleting
+                            if (confirm(`Are you sure you want to delete the mnemonic "${listData.name || 'this list'}"? This cannot be undone.`)) {
+                                await deleteList(listData.id);
+                            }
+                        });
+                        savedListsContainer.appendChild(div);
+                    });
+                }
+                setStatus('Saved lists updated from your Memory Vault.', 'success');
+                showLoading(false);
+            }, (error) => {
+                console.error("Error fetching saved lists with onSnapshot: ", error);
+                setStatus(`Error loading lists: ${error.message}`, 'error', 0);
+                savedListsContainer.innerHTML = '<p class="text-red-500">Could not load saved lists. Check console.</p>';
+                showLoading(false);
+            });
+        }
+        
+        async function deleteList(docId) {
+            if (!isAuthReady || !userId || userId.startsWith('local-anon-')) {
+                setStatus('Authentication not ready or using local fallback. Cannot delete from cloud.', 'error');
+                return;
+            }
+            showLoading(true);
+            setStatus('🗑️ Deleting list...', 'info', 0);
+            try {
+                const docRef = doc(db, `artifacts/${appId}/users/${userId}/mnemonics`, docId);
+                await deleteDoc(docRef);
+                setStatus('List deleted successfully!', 'success');
+                // onSnapshot will update the UI automatically
+            } catch (error) {
+                console.error("Error deleting document: ", error);
+                setStatus(`Error deleting list: ${error.message}`, 'error', 0);
+            } finally {
+                showLoading(false);
+            }
+        }
+
+        function viewSavedList(listData) {
+            listInput.value = listData.items;
+            mnemonicDisplay.textContent = listData.mnemonic;
+            explanationDisplay.textContent = listData.explanation;
+            listNameInput.value = listData.name;
+            setStatus(`👁️ Viewing: "${listData.name}". You can edit and re-save if needed.`, 'info', 0);
+            saveBtn.disabled = false; 
+            listNameInput.disabled = false;
+            window.scrollTo({ top: 0, behavior: 'smooth' }); 
+        }
+
+        // Initial setup
+        saveBtn.disabled = true;
+        listNameInput.disabled = true;
+
+    </script>
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f0f4f8; /* Light blue-gray background */
+        }
+        .app-container {
+            max-width: 800px;
+            margin: 2rem auto;
+            padding: 2rem;
+            background-color: white;
+            border-radius: 12px;
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.1);
+        }
+        .section-title {
+            font-size: 1.5rem; /* 24px */
+            font-weight: 600;
+            color: #1e3a8a; /* Darker blue */
+            margin-bottom: 1rem;
+            border-bottom: 2px solid #3b82f6; /* Blue accent */
+            padding-bottom: 0.5rem;
+        }
+        .input-label {
+            display: block;
+            margin-bottom: 0.5rem;
+            font-weight: 500;
+            color: #374151; /* Gray-700 */
+        }
+        .text-input, textarea {
+            width: 100%;
+            padding: 0.75rem;
+            border: 1px solid #d1d5db; /* Gray-300 */
+            border-radius: 8px;
+            transition: border-color 0.2s;
+            font-size: 0.95rem;
+        }
+        .text-input:focus, textarea:focus {
+            outline: none;
+            border-color: #3b82f6; /* Blue-500 */
+            box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.3);
+        }
+        .btn {
+            padding: 0.75rem 1.5rem;
+            border-radius: 8px;
+            font-weight: 600;
+            transition: background-color 0.2s, transform 0.1s;
+            cursor: pointer;
+            font-size: 0.95rem;
+            text-align: center;
+        }
+        .btn:hover {
+            transform: translateY(-1px);
+        }
+        .btn-primary {
+            background-color: #3b82f6; /* Blue-500 */
+            color: white;
+        }
+        .btn-primary:hover {
+            background-color: #2563eb; /* Blue-600 */
+        }
+        .btn-secondary {
+            background-color: #10b981; /* Emerald-500 */
+            color: white;
+        }
+        .btn-secondary:hover {
+            background-color: #059669; /* Emerald-600 */
+        }
+        .btn-danger {
+            background-color: #ef4444; /* Red-500 */
+            color: white;
+        }
+        .btn-danger:hover {
+             background-color: #dc2626; /* Red-600 */
+        }
+        .btn-neutral {
+            background-color: #6b7280; /* Gray-500 */
+            color: white;
+        }
+        .btn-neutral:hover {
+            background-color: #4b5563; /* Gray-600 */
+        }
+        .btn:disabled {
+            background-color: #9ca3af; /* Gray-400 */
+            color: #e5e7eb;
+            cursor: not-allowed;
+            transform: none;
+        }
+        .output-box {
+            background-color: #f9fafb; /* Gray-50 */
+            padding: 1rem;
+            border-radius: 8px;
+            border: 1px solid #e5e7eb; /* Gray-200 */
+            min-height: 80px;
+            white-space: pre-wrap; 
+            word-wrap: break-word;
+            font-size: 0.95rem;
+        }
+        #savedListsContainer {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 1rem;
+        }
+        /* Instructions Box */
+        .instructions-box {
+            background-color: #eef2ff; /* Indigo-50 */
+            border: 1px solid #c7d2fe; /* Indigo-200 */
+            border-left-width: 4px;
+            border-left-color: #6366f1; /* Indigo-500 */
+        }
+        textarea::-webkit-scrollbar { width: 8px; }
+        textarea::-webkit-scrollbar-track { background: #f1f1f1; border-radius: 10px; }
+        textarea::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
+        textarea::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+    </style>
+</head>
+<body class="text-gray-800">
+
+    <div class="app-container">
+        <header class="text-center mb-8">
+            <h1 class="text-4xl font-bold text-blue-700">MemoRise 🧠✨</h1>
+            <p class="text-lg text-gray-600 mt-2">Craft, Generate, and Vault Your Mnemonics!</p>
+        </header>
+
+        <section class="mb-8 p-4 instructions-box rounded-lg shadow">
+            <h2 class="text-xl font-semibold text-indigo-700 mb-3">Welcome to Your Mnemonic Assistant!</h2>
+            <ol class="list-decimal list-inside text-gray-700 space-y-1.5 text-sm">
+                <li>Type the items you want to remember in the "📋 Enter Your List" box (one item per line).</li>
+                <li>Click "✨ Generate Mnemonic". We'll ask your local AI to create a memorable one!</li>
+                <li>Review the generated mnemonic and its explanation.</li>
+                <li>Give your list a name (e.g., "Weekend Groceries") and click "💾 Save List" to store it.</li>
+                <li>Access your saved mnemonics anytime from "📚 My Saved Mnemonics" below. Click a card to view or delete.</li>
+            </ol>
+            <p class="mt-4 text-xs text-gray-600">
+                <strong>Local AI Setup:</strong> This app uses your <strong>local AI model</strong> via LM Studio (expected at <code>http://127.0.0.1:1234</code>). Ensure LM Studio is running, a compatible model is loaded, and the server is started. If you encounter connection or CORS issues, check LM Studio's server settings.
+            </p>
+        </section>
+
+        <section class="mb-6">
+            <label for="listInput" class="input-label">📋 Enter Your List (one item per line):</label>
+            <textarea id="listInput" rows="6" class="text-input" placeholder="e.g., Milk&#10;Eggs&#10;Bread&#10;Apples..."></textarea>
+            <div class="flex flex-col sm:flex-row sm:space-x-3 mt-3">
+                <button id="generateBtn" class="btn btn-primary w-full sm:flex-1 mb-2 sm:mb-0">✨ Generate Mnemonic</button>
+                <button id="clearInputsBtn" class="btn btn-neutral w-full sm:w-auto">🧹 Clear Current Inputs</button>
+            </div>
+        </section>
+
+        <div id="loadingIndicator" class="hidden text-center my-4">
+            <div class="inline-flex items-center px-4 py-2 font-semibold leading-6 text-sm shadow rounded-md text-white bg-blue-500 transition ease-in-out duration-150">
+                <svg class="animate-spin -ml-1 mr-3 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                Processing... Please Wait
+            </div>
+        </div>
+        <div id="statusMessage" class="hidden mt-4 p-3 rounded-md"></div>
+
+        <section class="mb-6">
+            <h2 class="section-title">💡 Your Generated Mnemonic</h2>
+            <div class="space-y-4">
+                <div>
+                    <h3 class="font-semibold text-gray-700 mb-1">Mnemonic Device:</h3>
+                    <p id="mnemonicDisplay" class="output-box text-blue-600 font-medium">Your generated mnemonic will appear here...</p>
+                </div>
+                <div>
+                    <h3 class="font-semibold text-gray-700 mb-1">How it Helps (Explanation):</h3>
+                    <p id="explanationDisplay" class="output-box text-sm text-gray-600">Explanation will appear here...</p>
+                </div>
+            </div>
+        </section>
+
+        <section class="mb-8">
+            <h2 class="section-title">💾 Save Your Mnemonic to Vault</h2>
+            <label for="listNameInput" class="input-label">List Name:</label>
+            <input type="text" id="listNameInput" class="text-input mb-3" placeholder="e.g., Weekly Groceries, History Exam Prep">
+            <button id="saveBtn" class="btn btn-secondary w-full sm:w-auto" disabled>💾 Save List to Vault</button>
+        </section>
+
+        <section>
+            <h2 class="section-title">📚 My Saved Mnemonics Vault</h2>
+            <div id="savedListsContainer" class="mt-4">
+                <p class="text-gray-500">Loading saved mnemonics or create your first one!</p>
+            </div>
+        </section>
+
+        <footer class="text-center mt-12 py-4 border-t border-gray-200">
+            <p class="text-sm text-gray-500">MemoRise App - Happy Memorizing!</p>
+            <p id="userIdDisplay" class="text-xs text-gray-400">User ID: Initializing...</p>
+        </footer>
+    </div>
+
+</body>
+</html>
